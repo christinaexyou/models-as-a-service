@@ -309,6 +309,51 @@ func ensureInfraNamespaceWithClient(ctx context.Context, namespace string, clien
 	return ensureManagedNamespaceWithClient(ctx, namespace, "infra", clientset)
 }
 
+// bootstrapManagedNamespaces either ensures/migrates the infrastructure
+// namespace (when it is separate from the controller namespace) or labels the
+// controller namespace for guardrails (when infrastructure is shared with the
+// controller namespace)
+func bootstrapManagedNamespaces(ctx context.Context, clientset kubernetes.Interface,
+	infraNamespace, controllerNamespace, maasSubscriptionNamespace string,
+) bool {
+	// Ensure infrastructure namespace exists when it differs from controller namespace
+	if infraNamespace != "" && infraNamespace != controllerNamespace {
+		if err := ensureInfraNamespaceWithClient(ctx, infraNamespace, clientset); err != nil {
+			setupLog.Error(err, "unable to ensure infrastructure namespace exists", "namespace", infraNamespace)
+			os.Exit(1)
+		}
+
+		// Migrate maas-db-config secret from controller namespace to infrastructure namespace
+		if err := migrateMaaSDBSecretToInfraNamespace(ctx, controllerNamespace, infraNamespace, clientset); err != nil {
+			if errors.IsForbidden(err) {
+				setupLog.Info("insufficient RBAC to migrate maas-db-config secret — "+
+					"ensure secret-migrate Roles and RoleBindings are applied; skipping migration for now",
+					"controllerNamespace", controllerNamespace,
+					"infraNamespace", infraNamespace,
+					"error", err)
+			} else {
+				setupLog.Error(err, "failed to migrate maas-db-config secret to infrastructure namespace",
+					"controllerNamespace", controllerNamespace,
+					"infraNamespace", infraNamespace)
+				os.Exit(1)
+			}
+		}
+	} else if infraNamespace != "" {
+		// Shared namespace: add the guardrails label only.
+		if err := labelInfraNamespace(ctx, infraNamespace, clientset); err != nil {
+			setupLog.Error(err, "unable to label infrastructure namespace for NeMo guardrails", "namespace", infraNamespace)
+			os.Exit(1)
+		}
+	}
+
+	defaultSubscriptionNamespaceExists, err := subscriptionNamespaceExists(ctx, maasSubscriptionNamespace, clientset)
+	if err != nil {
+		setupLog.Error(err, "unable to inspect subscription namespace", "namespace", maasSubscriptionNamespace)
+		os.Exit(1)
+	}
+	return defaultSubscriptionNamespaceExists
+}
+
 // resolveNamespaceAfterTerminationWait interprets the namespace GET after a successful termination poll.
 // If fallThroughToCreate is true, the caller must assign the original finalErr to the outer GET error and
 // continue into namespace creation. If fallThroughToCreate is false and the returned error is nil, the
@@ -1139,42 +1184,9 @@ func main() {
 		setupLog.Error(err, "unable to ensure AITenant namespace exists", "namespace", aitenantNamespace)
 		os.Exit(1)
 	}
-	// Ensure infrastructure namespace exists when it differs from controller namespace
-	// (required for operator-only installs that don't run setup-database.sh)
-	if infraNamespace != "" && infraNamespace != controllerNamespace {
-		if err := ensureInfraNamespaceWithClient(context.Background(), infraNamespace, clientset); err != nil {
-			setupLog.Error(err, "unable to ensure infrastructure namespace exists", "namespace", infraNamespace)
-			os.Exit(1)
-		}
-
-		// Migrate maas-db-config secret from controller namespace to infrastructure namespace
-		if err := migrateMaaSDBSecretToInfraNamespace(context.Background(), controllerNamespace, infraNamespace, clientset); err != nil {
-			if errors.IsForbidden(err) {
-				setupLog.Info("insufficient RBAC to migrate maas-db-config secret — "+
-					"ensure secret-migrate Roles and RoleBindings are applied; skipping migration for now",
-					"controllerNamespace", controllerNamespace,
-					"infraNamespace", infraNamespace,
-					"error", err)
-			} else {
-				setupLog.Error(err, "failed to migrate maas-db-config secret to infrastructure namespace",
-					"controllerNamespace", controllerNamespace,
-					"infraNamespace", infraNamespace)
-				os.Exit(1)
-			}
-		}
-	} else if infraNamespace != "" {
-		// Shared namespace: add the guardrails label only.
-		if err := labelInfraNamespace(context.Background(), infraNamespace, clientset); err != nil {
-			setupLog.Error(err, "unable to label infrastructure namespace for NeMo guardrails", "namespace", infraNamespace)
-			os.Exit(1)
-		}
-	}
-
-	defaultSubscriptionNamespaceExists, err := subscriptionNamespaceExists(context.Background(), maasSubscriptionNamespace, clientset)
-	if err != nil {
-		setupLog.Error(err, "unable to inspect subscription namespace", "namespace", maasSubscriptionNamespace)
-		os.Exit(1)
-	}
+	defaultSubscriptionNamespaceExists := bootstrapManagedNamespaces(
+		context.Background(), clientset, infraNamespace, controllerNamespace, maasSubscriptionNamespace,
+	)
 	nsCfg := map[string]cache.Config{maasSubscriptionNamespace: {}}
 	// maas-db-config lives in the infrastructure namespace (where maas-api runs).
 	infraNsCfg := map[string]cache.Config{infraNamespace: {}}
